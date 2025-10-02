@@ -178,5 +178,14 @@ FC (128 -   64 -   36)  	Классификация	Полносвязные с�
 •	Разработка интерфейса для ручного управления и отладки.<br>
 
 
+# Фотоотчёт 
+![photo_2025-10-02 13 30 01](https://github.com/user-attachments/assets/600bfe19-f85c-4446-b7d2-5e8cf41639ce)
+![photo_2025-10-02 13 30 09](https://github.com/user-attachments/assets/fe2f10ea-2deb-4ef3-9cf7-61317c59b725)
+![photo_2025-10-02 13 30 59](https://github.com/user-attachments/assets/d3eac6a2-be8d-41cd-84f7-8b644f6e2e68)
+
+
+
+
+
 
 
