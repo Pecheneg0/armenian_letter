@@ -1335,23 +1335,23 @@ class DroneController:
             if self.landing_offsets_log:
                 graph_result, error = self.generate_3d_trajectory_graph(report_dir, filename_base)
                 if graph_result:
-                    self.send_ssh_message(f"✓ 3D-график: {graph_result['pdf']}")
+                    self.send_ssh_message(f"3D-график: {graph_result['pdf']}")
                 else:
-                    self.send_ssh_message(f"⚠ Ошибка графика: {error}")
+                    self.send_ssh_message(f"Ошибка графика: {error}")
             
             # 2. GIF (опционально)
             if len(self.landing_offsets_log) >= 10:
                 gif_path, error = self.generate_landing_gif(report_dir, filename_base)
                 if gif_path:
-                    self.send_ssh_message(f"✓ GIF-анимация: {gif_path}")
+                    self.send_ssh_message(f"GIF-анимация: {gif_path}")
             
             # 3. PDF отчёт
             pdf_path = self.generate_pdf_report(report_dir, filename_base)
             if pdf_path:
-                self.send_ssh_message(f"✓ PDF-отчёт: {pdf_path}")
+                self.send_ssh_message(f"PDF-отчёт: {pdf_path}")
                 self.send_ssh_message(f"Все файлы в: {report_dir}/")
             else:
-                self.send_ssh_message("⚠ Не удалось сгенерировать PDF")
+                self.send_ssh_message("Не удалось сгенерировать PDF")
             
             # 4. Сохранение данных в JSON (для последующей обработки)
             json_path = f"{report_dir}/{filename_base}_data.json"
@@ -1364,7 +1364,7 @@ class DroneController:
             
         except Exception as e:
             logging.error(f"Ошибка генерации финального отчёта: {e}")
-            self.send_ssh_message(f"⚠ Ошибка отчёта: {e}")
+            self.send_ssh_message(f"Ошибка отчёта: {e}")
 
 if __name__ == '__main__':
     controller = DroneController()
