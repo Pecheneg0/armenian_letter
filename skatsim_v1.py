@@ -190,10 +190,10 @@ dist_coeffs = np.zeros((5, 1), dtype=np.float32)
 #torch.set_num_threads(2)
 #cv2.setNumThreads(2)
 
-try:
-    resource.setrlimit(resource.RLIMIT_AS, (2*1024*1024*1024, 2*1024*1024*1024))  
-except:
-    pass  
+#try:
+ #   resource.setrlimit(resource.RLIMIT_AS, (2*1024*1024*1024, 2*1024*1024*1024))  
+#except:
+ #   pass  
 
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(ARUCO_DIR, exist_ok=True)
@@ -345,17 +345,17 @@ class DroneController:
                     color='gray', linewidth=0.5, alpha=0.3, label='Траектория')
             
             # Оси
-            ax.set_xlim(-20, 20)
-            ax.set_ylim(-20, 20)
-            ax.set_xlabel('Восток-Запад (м)\n(+ = восток)', fontsize=10, labelpad=10)
-            ax.set_ylabel('Север-Юг (м)\n(+ = север)', fontsize=10, labelpad=10)
-            ax.set_zlabel('Высота (м)', fontsize=10, labelpad=10)
-            ax.set_zlim(0, max(50, max(altitudes) * 1.2))
+            ax.set_xlim(-10, 10)
+            ax.set_ylim(-10, 10)
+            ax.set_xlabel('Восток-Запад (м)\n(+ = восток)', fontsize=5, labelpad=5)
+            ax.set_ylabel('Север-Юг (м)\n(+ = север)', fontsize=5, labelpad=5)
+            ax.set_zlabel('Высота (м)', fontsize=5, labelpad=5)
+            ax.set_zlim(0, max(20, max(altitudes) * 1.2))
             
             # Сетка и зона допуска
             ax.grid(True, alpha=0.3)
             tolerance = self.pos_tolerance
-            theta = np.linspace(0, 2*np.pi, 50)
+            theta = np.linspace(0, 2*np.pi, 10)
             x_cyl = tolerance * np.cos(theta)
             y_cyl = tolerance * np.sin(theta)
             z_cyl = np.linspace(0, 2, 2)
@@ -402,9 +402,9 @@ class DroneController:
             fig = plt.figure(figsize=(10, 8), dpi=100)
             ax = fig.add_subplot(111, projection='3d')
             
-            ax.set_xlim(-20, 20)
-            ax.set_ylim(-20, 20)
-            ax.set_zlim(0, max(50, max(altitudes) * 1.2))
+            ax.set_xlim(-10, 10)
+            ax.set_ylim(-10, 10)
+            ax.set_zlim(0, max(20, max(altitudes) * 1.2))
             ax.set_xlabel('Восток-Запад (м)')
             ax.set_ylabel('Север-Юг (м)')
             ax.set_zlabel('Высота (м)')
