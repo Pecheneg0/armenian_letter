@@ -1323,7 +1323,8 @@ class DroneController:
             self.report_data['system_stats']['pixhawk_connected'] = self.is_pixhawk_connected
             self.report_data['system_stats']['model_loaded'] = self.model_loaded
             
-            report_dir = "/home/pi/Desktop/reports"
+            report_dir = "/media/pi/Smartbuy/reports"
+
             os.makedirs(report_dir, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename_base = f"mission_{timestamp}"
