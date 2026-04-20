@@ -148,7 +148,7 @@ class DroneController:
         """Обработка входящих MAVLink команд"""
         while True:
             msg = self.master.recv_match(type='COMMAND_LONG', blocking=False)
-            self.send_ssh_message("Получена команда") 
+            #self.send_ssh_message("Получена команда") 
             if not msg:
                 break
                 

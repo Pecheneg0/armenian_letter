@@ -8,9 +8,9 @@ from libcamera import controls
 
 # === Конфигурация ===
 MARKER_ID = 42
-MARKER_LENGTH = 0.18  # в метрах
+MARKER_LENGTH = 0.04  # в метрах
 FULL_RES = (1920, 1080)
-PREVIEW_RES = (640, 360)
+PREVIEW_RES = (1920, 1080)
 SAVE_DIR = "/home/pi/aruco_test_output"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
@@ -66,7 +66,7 @@ while True:
             [corners[idx]], MARKER_LENGTH, camera_matrix, dist_coeffs)
 
         offset_north, offset_east, altitude = calculate_offset(rvecs[0], tvecs[0], drone_yaw_deg)
-        print(f"✅ Offset: N = {offset_north:.2f} m | E = {offset_east:.2f} m | Alt = {altitude:.2f} m")
+        print(f"✅ Offset: N = {offset_north:.2f} m | E = { -offset_east:.2f} m | Alt = {altitude:.2f} m")
 
         cv2.aruco.drawDetectedMarkers(frame, [corners[idx]])
         cv2.drawFrameAxes(frame, camera_matrix, dist_coeffs, rvecs[0], tvecs[0], 0.1)
@@ -81,6 +81,7 @@ while True:
 
     # Уменьшенный preview
     preview = cv2.resize(frame, PREVIEW_RES)
+
     cv2.imshow("Aruco CSI Preview", preview)
 
     if cv2.waitKey(1) & 0xFF == ord('q'):

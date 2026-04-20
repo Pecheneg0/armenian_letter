@@ -1,0 +1,1317 @@
+import cv2
+import numpy as np
+import time
+import torch
+from pymavlink import mavutil
+from torchvision import transforms
+from PIL import Image
+import os
+import math
+import logging
+import sys
+from datetime import datetime 
+from picamera2 import Picamera2
+from libcamera import controls
+from modelold import ArmenianLetterNet
+from collections import defaultdict
+from cv2 import aruco
+
+import resource
+import threading
+# ===== КОНФИГУРАЦИЯ =====
+MAVLINK_PORT = '/dev/ttyAMA0'
+MAVLINK_BAUD = 57600
+RC_CHANNEL = 6
+
+MODE_OFF = 0
+MODE_LETTERS = 1
+MODE_ARUCO = 2
+MODE_MGM = 3
+
+CAMERA_RESOLUTION_PICAM = (720, 720)  
+CAMERA_RESOLUTION_USBCAM = (720, 720)
+
+MARKER_42 = 42  # ID искомой метки
+MARKER_41 = 41
+LENGTH_41 = 0.08 # Длина стороны маркера в метрах
+LENGTH_42 = 0.32
+CAMERA_ID = 0
+
+DROP_SERVO_PWM_THRESHOLD = 1700
+MIN_AREA = 11000           # Минимальная площадь баннера (px)
+MAX_AREA = 400000
+
+MODEL_PATH = "ALM_best.pth"
+LABELS_PATH = "labels.txt"
+MAV_CMD_USER_1 = 31000
+
+TELEMETRY_INTERVAL = 2
+LOOP_DELAY = 0.02
+
+CONFIDENCE_THRESHOLD = 0.7   # Порог уверенности распознавания
+PROCESSING_FPS = 60           # Ограничение частоты обработки (кадров в секунду)
+PIXELS_PER_METER = 44.482  
+
+ARUCO_DIR = "/home/pi/Desktop/aruco_images"
+LETTERS_DIR = "/home/pi/Desktop/letters_images"
+LOG_DIR = "/home/pi/Desktop"
+MGM_DIR = "/home/pi/Desktop/mgm_images"
+CSV_PATH = "/home/pi/Desktop/objects-coordinates.csv" 
+ 
+# Максимально допустимая высота полёта в режиме LETTERS (ТЗ п.5.2.3.6)
+MAX_ALTITUDE_M = 150.0 
+
+# Геоидная поправка (Аномальная высота) для Московской области для перехода к WGS-84 эллипсоиду
+ANOMALOUS_HEIGHT = 14.5 
+
+# Параметры для детекции МГМ
+MODE_MGM = 3  # Новый режим для детекции МГМ
+LOWER_BLUE = np.array([83, 119, 40])
+UPPER_BLUE = np.array([129, 245, 255])
+MIN_CONTOUR_AREA = 500
+DETECTION_WINDOW_SEC = 7
+CONSECUTIVE_DETECTIONS_TO_CONFIRM = 10
+DEBUG_MODE_MGM = False
+DROP_SERVO_ID = 8
+
+
+frame_w, frame_h = 720, 720
+camera_matrix = np.array([
+    [1000, 0, frame_w / 2],
+    [0, 1000, frame_h / 2],
+    [0, 0, 1]
+], dtype=np.float32)
+dist_coeffs = np.zeros((5, 1), dtype=np.float32)
+
+
+# Ограничение потоков для PyTorch и OpenCV
+torch.set_num_threads(2)
+cv2.setNumThreads(2)
+
+# Ограничение памяти (опционально, но рекомендуется)
+try:
+    resource.setrlimit(resource.RLIMIT_AS, (2*1024*1024*1024, 2*1024*1024*1024))  # ~2GB
+except:
+    pass  # Может не работать на всех системах
+
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(ARUCO_DIR, exist_ok=True)
+os.makedirs(LETTERS_DIR, exist_ok=True)
+os.makedirs(MGM_DIR, exist_ok=True)
+os.makedirs(CSV_PATH, exist_ok=True)
+
+logging.basicConfig(
+    filename=os.path.join(LOG_DIR, "SKAT_mgm.log"),
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+class DroneController:
+    def __init__(self):
+        self.master = None
+        self.current_mode = MODE_OFF
+        self.camera = None
+        self.model = None
+        self.labels = []
+        self.rc_stable_count = 0
+        self.last_telemetry_time = 0
+        self.current_mode_str = "OFF"
+        self.last_rc_value = None
+        self.last_wp_value = None        
+        self.process_ARUCO = False
+        self.process_LETTERS = False
+        self.process_MGM = False
+        self.process_OFF = False
+        self.USE_PICAM = False
+        self.USE_USB_CAM = False
+        self.no_process = False
+        self.transform = None
+        self.min_altitude = 2
+        self.pos_tolerance = 0.15
+        self.land_command_sent = False
+        self.drone_in_guided = False
+        self.guided_mode = False
+        self.reached_200m = False
+
+        self.last_wp_time = 0
+        self.last_rc_time = 0
+        self.wp_interval = 2
+        self.rc_interval = 0.25
+
+        self._last_lat = 0.0
+        self._last_lon = 0.0
+        self._last_alt = 0.0
+        self._last_alt_agl = 0.0
+        self._last_yaw = 0.0
+
+        self.letter_stats = defaultdict(lambda: {'confidences': [], 'coords': [], 'timestamps': []})
+        self.processing_active = False
+        self.last_detection_time = 0
+        self.processing_sessions = []
+        self.LETTER_TIMEOUT = 2.0
+        self.MIN_DETECTIONS = 3
+        self.SAVE_INTERVAL = 0.3
+        self.last_save_time = 0
+
+        self.aruco_dict = cv2.aruco.getPredefinedDictionary(aruco.DICT_6X6_250)
+        self.parameters = cv2.aruco.DetectorParameters()
+        self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.parameters)
+
+        
+        # Для обработки букв
+        self.last_processing_time = 0
+        self.last_save_time = 0
+        self.processing_interval = 1.0 / PROCESSING_FPS
+        self.is_pixhawk_connected = False
+        self.model_loaded = False
+        if not self.is_pixhawk_connected:
+            self.connect_to_pixhawk()
+            self.is_pixhawk_connected = True
+        
+        #self.logger = logging.getLogger("modeswitcher")
+        
+        # Соответствие точек миссии режимам
+        self.wp_modes = {2: MODE_LETTERS, 17: MODE_ARUCO, 0: MODE_OFF, 20: MODE_MGM}
+        
+        # Инициализация преобразований изображения
+        self.transform = transforms.Compose([
+            transforms.Grayscale(num_output_channels=1),
+            transforms.Resize((32, 32)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,), (0.5,))
+        ])
+        
+    def connect_to_pixhawk(self):
+        while True:
+            try:
+                self.master = mavutil.mavlink_connection(MAVLINK_PORT, baud=MAVLINK_BAUD)
+                self.master.wait_heartbeat()
+                logging.info(f"Подключение: {self.master.target_system}")
+                #self.send_ssh_message(f"Подключение:  {self.master.target_system}")
+
+                break
+            except Exception as e:
+                logging.error(f"Ошибка подключения к Pixhawk: {e}. Повтор через 5 с...")
+                self.send_ssh_message(f"Ошибка подключения к  Pixhawk {e}. Повтор 5 с...") 
+
+                time.sleep(5)
+
+    def get_current_waypoint(self):
+        current_time = time.time()
+        if current_time - self.last_wp_time < self.wp_interval:
+            return None
+        self.last_wp_time = current_time
+        msg = self.master.recv_match(type='MISSION_CURRENT', blocking=False)
+        return msg.seq if msg else None
+
+    def get_rc_value(self):
+        current_time = time.time()
+        if current_time - self.last_rc_time < self.rc_interval:
+            return None
+        self.last_rc_time = current_time 
+        msg = self.master.recv_match(type='RC_CHANNELS', blocking=False)
+        if msg:
+            try:
+                return getattr(msg, f'chan{RC_CHANNEL}_raw')
+            except AttributeError:
+                pass
+        return None
+
+    def rc_to_mode(self, rc_value):
+        if rc_value < 1200: return MODE_OFF
+        if rc_value < 1700: return MODE_LETTERS
+        return MODE_ARUCO
+
+    def send_ssh_message(self, message):
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+        sys.stdout.flush()
+
+    def load_model(self):
+        try:
+            self.model = ArmenianLetterNet()
+            self.model.load_state_dict(torch.load(MODEL_PATH, map_location=torch.device('cpu')))
+            self.model.eval()
+            with open(LABELS_PATH, "r", encoding="utf-8") as f:
+                self.labels = [line.strip() for line in f.readlines()]
+            logging.info(" Модель загружена")
+        except Exception as e:
+            logging.error(f" Ошибка загрузки модели: {e}")
+            raise
+
+    def init_camera(self):
+        try:
+            if self.USE_PICAM:
+                self.camera = Picamera2()
+                config = self.camera.create_preview_configuration(
+                    main={"size": CAMERA_RESOLUTION_PICAM, "format": "RGB888"},
+                    controls={
+                        "FrameRate": PROCESSING_FPS,
+                        "AwbEnable": True,  # Отключаем авто баланс белого
+                        "AwbMode": True,       # Режим "Auto" (0) или конкретный режим освещения
+                        "AeEnable": True,   # авто экспозиция
+                        "ExposureTime": 4900,  # В микросекундах (начните с 10000 и регулируйте)
+                        "AnalogueGain": 3.6,    # Минимальное усиление
+                        "Brightness": 0,      # 0-1 (рекомендуется 0.1-0.3)
+                        "Contrast": 1,        # 1.0 = нормальный, >1.0 увеличивает контраст
+                        "Saturation": 0,      # 0.0-2.0 (меньше = менее насыщенные цвета)
+                        "Sharpness": 1,       # 0.0-16.0 (умеренная резкость)
+                    }
+                )
+                self.camera.configure(config)
+                self.camera.start()
+                logging.info("PiCamera запущена с ручными настройками экспозиции")
+
+            elif self.USE_USB_CAM:
+                self.camera = cv2.VideoCapture(CAMERA_ID, cv2.CAP_V4L2)  # Используем V4L2 для лучшего контроля
+                if not self.camera.isOpened():
+                    logging.error("Ошибка открытия камеры USB")
+                    self.send_ssh_message("Ошибка открытия камеры USB")
+                    self.camera = None
+                    return
+
+                # Установка основных параметров
+                self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_RESOLUTION_USBCAM[0])
+                self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_RESOLUTION_USBCAM[1])
+                self.camera.set(cv2.CAP_PROP_FPS, PROCESSING_FPS)
+                
+                # Расширенные настройки для борьбы с засветкой
+                self.camera.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0)      # 1 = manual exposure
+                self.camera.set(cv2.CAP_PROP_EXPOSURE, 0)          # Чем меньше, тем темнее (10-100)
+                self.camera.set(cv2.CAP_PROP_AUTO_WB, 0)            # Отключаем авто баланс белого
+                self.camera.set(cv2.CAP_PROP_WB_TEMPERATURE, 4800)  # Ручная установка баланса белого
+                self.camera.set(cv2.CAP_PROP_GAIN, 0)              # Минимальное усиление (0-100)
+                self.camera.set(cv2.CAP_PROP_BRIGHTNESS, 0)        # 0-100 (рекомендуется 10-30)
+                self.camera.set(cv2.CAP_PROP_CONTRAST, 10)          # 0-100 (рекомендуется 40-60)
+                self.camera.set(cv2.CAP_PROP_SATURATION, 0)         # 0-100 (меньше = меньше засветки)
+                self.camera.set(cv2.CAP_PROP_SHARPNESS, 0)          # 0-100 (умеренная резкость)
+                self.camera.set(cv2.CAP_PROP_BACKLIGHT, 0)           # Отключаем подсветку
+                
+                # Проверка установленных значений
+                actual_settings = {
+                    "Width": self.camera.get(cv2.CAP_PROP_FRAME_WIDTH),
+                    "Height": self.camera.get(cv2.CAP_PROP_FRAME_HEIGHT),
+                    "FPS": self.camera.get(cv2.CAP_PROP_FPS),
+                    "Exposure": self.camera.get(cv2.CAP_PROP_EXPOSURE),
+                    "Gain": self.camera.get(cv2.CAP_PROP_GAIN)
+                }
+                logging.info(f"Настройки USB камеры: {actual_settings}")
+                
+        except Exception as e:
+            logging.error(f"Ошибка запуска камеры: {str(e)}")
+            self.send_ssh_message(f"Ошибка запуска камеры: {str(e)}")
+            self.camera = None
+        
+
+    def process_mgm(self):
+        while True:
+            msg =self. master.recv_match(type='SERVO_OUTPUT_RAW', blocking=False)
+            if not msg: continue
+
+            servo_pwm = getattr(msg, f'servo{DROP_SERVO_ID+1}_raw', 0)
+            if servo_pwm > DROP_SERVO_PWM_THRESHOLD:
+                logging.info(f"Получен сигнал сброса! (Серво {DROP_SERVO_ID+1} PWM = {servo_pwm})")
+                
+                #logging.info("Возврат в режим ожидания...")
+                time.sleep(5)
+                        
+                """Режим детекции МГМ"""
+                #self.send_ssh_message("=== Активирован режим детекции МГМ ===")
+                
+                # Инициализация камеры для MGM
+                self.USE_PICAM = False
+                self.USE_USB_CAM = True
+                self.init_camera()
+                
+                if not (self.USE_USB_CAM and self.camera and self.camera.isOpened()):
+                    self.send_ssh_message("Ошибка инициализации камеры для MGM")
+                    return
+                
+                start_time = time.time()
+                consecutive_hits = 0
+                max_hits_achieved = 0
+                detection_confirmed = False
+                last_save_time = time.time()
+                #self.send_ssh_message(f"===== АКТИВАЦИЯ ОКНА ДЕТЕКЦИИ ({DETECTION_WINDOW_SEC} сек) =====")
+                
+                try:
+                    while time.time() - start_time < DETECTION_WINDOW_SEC:
+                        # Проверяем, не сменился ли режим
+                        if self.check_mode() != MODE_MGM:
+                            #self.send_ssh_message("Прерывание детекции MGM: сменился режим")
+                            return
+                        
+                        frame = self.get_frame()
+                        if frame is None:
+                            time.sleep(0.1)
+                            continue
+                        
+                        # Обработка изображения для детекции синего объекта
+                        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+                        mask = cv2.inRange(hsv, LOWER_BLUE, UPPER_BLUE)
+                        mask = cv2.erode(mask, None, iterations=2)
+                        mask = cv2.dilate(mask, None, iterations=2)
+                        contours, _ = cv2.findContours(mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        
+                        found = False
+                        if len(contours) > 0:
+                            main_contour = max(contours, key=cv2.contourArea)
+                            if cv2.contourArea(main_contour) > MIN_CONTOUR_AREA:
+                                found = True
+                        
+                        if found:
+                            consecutive_hits += 1
+                        
+                        if consecutive_hits > max_hits_achieved:
+                                max_hits_achieved = consecutive_hits
+                        else:
+                            consecutive_hits = 0
+                        
+                        # Условие подтверждения детекции
+                        if consecutive_hits >= CONSECUTIVE_DETECTIONS_TO_CONFIRM:
+                            detection_confirmed = True
+                            #self.send_ssh_message(f"!!! МГМ ПОДТВЕРЖДЕН ({consecutive_hits} последовательных кадров) !!!")
+                            break
+
+                        # Отладочная информация
+                        if DEBUG_MODE_MGM:
+
+                            cv2.putText(frame, f"Hits: {consecutive_hits}/{CONSECUTIVE_DETECTIONS_TO_CONFIRM}", 
+                                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+                            #cv2.imshow("MGM Detection", frame)
+
+                            cv2.waitKey(1)
+                        
+                        time.sleep(0.05)
+                    
+                    if detection_confirmed:
+                        logging.info(f"!!! МГМ ПОДТВЕРЖДЕН ({max_hits_achieved} последовательных кадров) !!!")
+                        logging.info("===== ЦИКЛ ДЕТЕКЦИИ ЗАВЕРШЕН (УСПЕХ) =====")
+                        if time.time() - last_save_time > 10:
+                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+                            filename = os.path.join(MGM_DIR, f"mgm_{timestamp}.jpg")
+                            cv2.imwrite(filename, frame)
+                            print(f"Сохранено изображение: {filename}")
+                            self.send_ssh_message(f" Сохранено изображение: {filename}")
+                            last_save_time = time.time()
+
+                    else:
+                        self.send_ssh_message(f"МГМ не подтвержден. Макс. последовательных кадров: {max_hits_achieved}")
+                    
+                    self.send_ssh_message("===== ЦИКЛ ДЕТЕКЦИИ МГМ ЗАВЕРШЕН =====")
+                    time.sleep(5)
+                    
+                finally:
+                    # Всегда освобождаем ресурсы
+                    self.release_camera()
+                    if DEBUG_MODE_MGM:
+                        cv2.destroyAllWindows()
+
+
+    def get_current_altitude(self):
+        msg = self.master.recv_match(type="GLOBAL_POSITION_INT", blocking=False)
+        if not self.reached_200m :
+            altitude = msg.relative_alt / 1e3 
+            if altitude is not None and altitude >= 200:
+                logging.info(f"Отметка в 200 метров достигнута, высота : {altitude}")
+                #self.send_ssh_message(f"Отметка в 200 метров достигнута, высота : {altitude}")
+                self.reached_200m = True
+        return msg.relative_alt / 1e3 if msg else 0.0
+
+    def descent(self, target_alt):        
+        self.master.mav.set_position_target_local_ned_send(
+            0,
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_FRAME_LOCAL_OFFSET_NED,
+            int(0b100111111000),
+            0, 0, target_alt,
+            0, 0, 0, 0, 0, 0, 0, 0)
+        
+    #Модуль нужный для отправки смещений по MAVLink в offset2.lua
+    def send_offset_command(self, offset_north, offset_east):
+        """Отправляет команду смещения в Lua-скрипт"""
+        self.master.mav.command_long_send
+        (
+            self.master.target_system,
+            self.master.target_component,
+            MAV_CMD_USER_1,  # 31000 - пользовательская команда
+            0,  # confirmation
+            offset_north,    # param1 - смещение на север (м)
+            offset_east,     # param2 - смещение на восток (м)
+            0, 0, 0, 0, 0   # остальные параметры не используются
+        )
+        logging.info(f"Отправка команды смещения: Север={offset_north:.2f}м, Восток={offset_east:.2f}м")
+
+    def release_camera(self):
+        if self.camera:
+            try:
+                if self.USE_PICAM:
+                    self.camera.stop()
+                    self.camera.close()
+                    self.camera = None
+                    logging.info("PiCamera остановлена")
+                    #self.send_ssh_message("PiCamera остановлена") 
+                elif self.USE_USB_CAM:
+                    self.camera.release()
+                    self.camera = None
+                    logging.info("USB-камера остановлена")
+                    #self.send_ssh_message("USB-камера остановлена")
+            except Exception as e:
+                logging.warning(f"Ошибка при остановке камеры: {e}")
+                self.send_ssh_message(f"Ошибка при остановке камеры: {e}") 
+    
+    def calculate_offset(self, tvec):
+        x_cam = -tvec[0][1]
+        y_cam = tvec[0][0]
+        yaw_deg = self.get_yaw()
+        yaw_rad = np.radians(yaw_deg)
+        R = np.array([
+            [np.cos(yaw_rad), -np.sin(yaw_rad)],
+            [np.sin(yaw_rad),  np.cos(yaw_rad)]
+        ])
+        offset = R @ np.array([x_cam, y_cam])
+        return offset[0], offset[1]  # North, East
+    
+    def handle_mode_switch(self, new_mode):
+        mode_names = {MODE_OFF: "OFF", MODE_LETTERS: "LETTERS", MODE_ARUCO: "ARUCO", MODE_MGM: "MGM"}
+        new_mode_str = mode_names.get(new_mode, "UNKNOWN")
+    
+        if new_mode_str != self.current_mode_str:
+            self.send_ssh_message(f" Переключение режима: {self.current_mode_str} -> {new_mode_str}")
+            self.current_mode_str = new_mode_str
+
+    def pixels_to_meters(self, pixel_x, pixel_y, ppm):
+        return pixel_x / ppm, pixel_y / ppm
+    
+    def geo_to_3d_xyz(self, lat_deg, lon_deg, h_ellipsoid):
+        """Перекод в прямоугольные XYZ (ГОСТ 32453-2017)"""
+        a = 6378137.0  # WGS-84
+        f = 1/298.257223563
+        e2 = 2*f - f**2
+        
+        B = math.radians(lat_deg)
+        L = math.radians(lon_deg)
+        
+        N = a / math.sqrt(1 - e2 * math.sin(B)**2)
+        X = (N + h_ellipsoid) * math.cos(B) * math.cos(L)
+        Y = (N + h_ellipsoid) * math.cos(B) * math.sin(L)
+        Z = ((1 - e2) * N + h_ellipsoid) * math.sin(B)
+        return X, Y, Z
+
+    def add_meters_to_coords_static(self, lat, lon, dx_m, dy_m, yaw_deg=0):
+        yaw_rad = math.radians(yaw_deg)
+        north_m = dy_m * math.cos(yaw_rad) + dx_m * math.sin(yaw_rad)
+        east_m = dx_m * math.cos(yaw_rad) - dy_m * math.sin(yaw_rad)
+        
+        METERS_PER_DEGREE_LAT = 111134.861111
+        METERS_PER_DEGREE_LON_AT_EQUATOR = 111321.377778
+        
+        dlat = north_m / METERS_PER_DEGREE_LAT
+        lat_rad = math.radians(lat)
+        meters_per_degree_lon = METERS_PER_DEGREE_LON_AT_EQUATOR * math.cos(lat_rad)
+        dlon = east_m / meters_per_degree_lon
+        
+        return lat + dlat, lon + dlon
+        
+    def xyz_to_geo_bowring(self, X, Y, Z):
+        """Перевод XYZ обратно в B, L, H (Алгоритм Боуринга)"""
+        a = 6378137.0
+        f = 1/298.257223563
+        e2 = 2*f - f**2
+        b = a * math.sqrt(1 - e2)
+        ep2 = e2 / (1 - e2)
+        
+        Q = math.sqrt(X**2 + Y**2)
+        if Q == 0:
+            return (90.0 if Z > 0 else -90.0), 0.0, (abs(Z) - b)
+            
+        r = math.sqrt(Z**2 + Q**2 * (1 - e2))
+        num = r**3 + b * ep2 * Z**2
+        den = r**3 - b * e2 * (1 - e2) * Q**2
+        
+        B_rad = math.atan((Z / Q) * (num / den))
+        L_rad = math.atan2(Y, X)
+        
+        N = a / math.sqrt(1 - e2 * math.sin(B_rad)**2)
+        H = Q / math.cos(B_rad) - N
+        
+        return math.degrees(B_rad), math.degrees(L_rad), H
+    
+    def add_meters_to_coords_dinam(self, lat, lon, dx_m, dy_m, yaw_deg=0, alt=0):
+        """
+        Высокоточный расчет координат цели с учетом:
+        1. Курса дрона (Yaw)
+        2. Аномальной высоты (Geoid Undulation)
+        3. Кривизны эллипсоида WGS-84
+        """
+        yaw_rad = math.radians(yaw_deg)
+        # 1. Поворот вектора смещения в систему North-East (исправленная матрица)
+        north_m = dy_m * math.cos(yaw_rad) - dx_m * math.sin(yaw_rad)
+        east_m = dy_m * math.sin(yaw_rad) + dx_m * math.cos(yaw_rad)
+        
+        # 2. Переход к эллипсоидальной высоте (Александр просил +14.5 м)
+        h_ellipsoid = alt + ANOMALOUS_HEIGHT
+        
+        # 3. Прямая задача: Lat/Lon -> XYZ
+        X, Y, Z = self.geo_to_3d_xyz(lat, lon, h_ellipsoid)
+        
+        # 4. Смещение в пространстве (приближенно в локальном горизонте)
+        lat_rad = math.radians(lat)
+        lon_rad = math.radians(lon)
+        
+        dX = -math.sin(lat_rad)*math.cos(lon_rad)*north_m - math.sin(lon_rad)*east_m
+        dY = -math.sin(lat_rad)*math.sin(lon_rad)*north_m + math.cos(lon_rad)*east_m
+        dZ =  math.cos(lat_rad)*north_m
+        
+        # 5. Обратная задача: XYZ + dXYZ -> Lat/Lon
+        new_lat, new_lon, _ = self.xyz_to_geo_bowring(X + dX, Y + dY, Z + dZ)
+        
+        return new_lat, new_lon
+
+    def get_frame(self):
+        try:
+            if self.USE_PICAM and self.camera:
+                return self.camera.capture_array()
+                
+            if self.USE_USB_CAM and self.camera:  # Упрощенная проверка
+                ret, frame = self.camera.read()
+                return frame if ret else None
+        except Exception as e:
+            logging.error(f"Ошибка захвата кадра: {e}")
+            return None
+        
+    def get_yaw(self):
+        try:
+            msg = self.master.recv_match(type='ATTITUDE', blocking=False)
+            if msg:
+                yaw = math.degrees(msg.yaw)
+                logging.info(f"Курс: {yaw:.1f}°")
+                return yaw
+        except Exception as e:
+            logging.error(f"Ошибка получения курса: {e}")
+            return 0.0
+
+    def get_coordinates(self):
+        msg = self.master.recv_match(type='GLOBAL_POSITION_INT', blocking=False)
+        if msg:
+            lat = msg.lat / 1e7
+            lon = msg.lon / 1e7
+            alt = msg.alt / 1e3
+            return lat, lon, alt
+        return 0.0, 0.0, 0.0
+        
+    def process_frame_dinam(self, frame):
+        # 1. Получаем телеметрию ОДИН раз за кадр (Оптимизация для Raspberry Pi)
+        current_lat, current_lon, alt = self.get_coordinates() 
+        yaw = self.get_yaw()
+
+        # Проверка ТЗ п.5.2.3.6: игнорируем кадр, если высота > 150 метров
+        if alt > MAX_ALTITUDE_M:
+            return [], None
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY) # Порог 180: надежная детекция на разных высотах
+        thresh_color = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Динамические пределы площади — масштабируем под текущую высоту дрона
+        alt_safe = max(alt, 1.0) # Защита от деления на ноль
+        _scale_sq = (30.0 / alt_safe) ** 2
+        dynamic_min_area = max(MIN_AREA * _scale_sq, 50)   # не меньше 50 пикс²
+        dynamic_max_area = MAX_AREA * _scale_sq
+
+        results = []
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if not (dynamic_min_area < area < dynamic_max_area):
+                continue
+
+            perimeter = cv2.arcLength(cnt, True)
+            circularity = 4 * np.pi * area / (perimeter ** 2) if perimeter > 0 else 0
+            if circularity < 0.4:  # Пониженный порог для смазанных кадров (было 0.6)
+                continue
+
+            mask = np.zeros_like(gray)
+            cv2.drawContours(mask, [cnt], -1, 255, -1)
+            mean_color = cv2.mean(gray, mask=mask)[0]
+            if mean_color < 160:  # Порог средней яркости пикселей (было 200)
+                continue
+
+            rect = cv2.minAreaRect(cnt)
+            box = cv2.boxPoints(rect)
+            box = np.intp(box)
+            center_x, center_y = int(rect[0][0]), int(rect[0][1])
+            
+            frame_center_x, frame_center_y = 720/2, 720/2
+            dx_px = center_x - frame_center_x
+            dy_px = -center_y + frame_center_y
+
+            dynamic_ppm = PIXELS_PER_METER * (30.0 / alt_safe)
+            raw_dx_m, raw_dy_m = self.pixels_to_meters(dx_px, dy_px, dynamic_ppm)
+            
+            # Корректировка вперед (камера наклонена на 45 градусов):
+            dx_m = raw_dx_m
+            dy_m = raw_dy_m + alt  # Используем честную высоту над землёй для смещения
+            
+            # Прибавляем метры к координатам дрона (3D пересчёт по ГОСТу с учетом аномальной высоты)
+            new_lat, new_lon = self.add_meters_to_coords_dinam(current_lat, current_lon, dx_m, dy_m, yaw_deg=yaw, alt=alt)
+            
+            results.append({
+                'center_px': (center_x, center_y),
+                'center_m': (dx_m, dy_m),
+                'raw_dx_m': raw_dx_m,
+                'raw_dy_m': raw_dy_m,
+                'coords': (new_lat, new_lon),
+                'alt': alt,
+                'box': box
+            })
+        
+        return results, thresh_color
+    def process_frame_static(self, frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY) # Подобрать необходимый порог
+        thresh_color = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        results = []
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if not (MIN_AREA < area < MAX_AREA):
+                continue
+
+            perimeter = cv2.arcLength(cnt, True)
+            circularity = 4 * np.pi * area / (perimeter ** 2) if perimeter > 0 else 0
+            if circularity < 0.6:  # Для квадрата ~0.78-0.85
+                continue
+
+            mask = np.zeros_like(gray)
+            cv2.drawContours(mask, [cnt], -1, 255, -1)
+            mean_color = cv2.mean(gray, mask=mask)[0]
+            if mean_color < 200:  # Средняя яркость внутри контура
+                continue
+
+            rect = cv2.minAreaRect(cnt)
+            box = cv2.boxPoints(rect)
+            box = np.int0(box)
+            center_x, center_y = int(rect[0][0]), int(rect[0][1])
+            
+            frame_center_x, frame_center_y = 720/2, 720/2
+            dx_px = center_x - frame_center_x
+            dy_px = -center_y + frame_center_y
+            current_lat, current_lon, _ = self.get_coordinates() 
+
+            dx_m, dy_m = self.pixels_to_meters(dx_px, dy_px, PIXELS_PER_METER)
+            new_lat, new_lon = self.add_meters_to_coords_dinam(current_lat, current_lon, dx_m, dy_m)
+            
+            results.append({
+                'center_px': (center_x, center_y),
+                'center_m': (dx_m, dy_m),
+                'coords': (new_lat, new_lon),
+                'box': box
+            })
+        
+        return results, thresh_color
+
+    def process_aruco(self):
+
+        TARGET_ALTITUDE = 1.5  # Высота переключения маркеров
+        current_target_id = MARKER_42  # Начинаем с маркера 42
+        current_length = LENGTH_42
+        
+        self.send_ssh_message(f"Старт поиска маркера {current_target_id} ")
+
+        logging.info(f"Старт поиска маркера {current_target_id} ")
+        
+        last_save_time = time.time()
+        last_command_time = 0
+        command_interval = 0.25  # Интервал между командами (сек)
+
+        while self.current_mode == MODE_ARUCO:
+
+            current_time = time.time()
+            if current_time - last_command_time < command_interval:
+                time.sleep(0.01)
+                continue
+                
+            last_command_time = current_time
+
+            new_mode = self.check_mode()
+            if new_mode != self.current_mode:
+                self.send_ssh_message(" Выход из режима ARUCO")
+                self.current_mode = new_mode
+                return
+                
+            frame = self.get_frame()
+            if frame is None:
+                time.sleep(0.01)
+                continue
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            corners, ids, _ = self.detector.detectMarkers(gray)
+            
+            if not self.drone_in_guided:
+                self.master.set_mode("GUIDED")
+                #print("Установлен режим GUIDED")
+                logging.info("Установлен режим GUIDED")
+                self.send_ssh_message("Установлен режим GUIDED")
+                self.drone_in_guided = True
+            
+            while not self.land_command_sent :
+
+                if ids is not None and current_target_id in ids.flatten():
+                    idx = list(ids.flatten()).index(current_target_id)
+                    rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
+                        [corners[idx]], current_length, camera_matrix, dist_coeffs
+                    )
+                    
+                    # Получаем реальную высоту (Z-координата)
+                    altitude = 0.5 * tvecs[0][0][2]
+                    offset_north, offset_east = self.calculate_offset(tvecs[0]) 
+                    
+                    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Маркер {current_target_id} | "
+                    f"Высота: {altitude:.3f}m | "
+                    f"Размер: {current_length}m")
+                    
+                    if time.time() - last_save_time > 5:
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        filename = os.path.join(ARUCO_DIR, f"aruco_{timestamp}.jpg")
+                        cv2.imwrite(filename, frame)
+                        #print(f"Сохранено изображение: {filename}")
+                        #self.send_ssh_message(f" Сохранено изображение: {filename}")
+                        last_save_time = time.time()
+                    
+                    # Проверка необходимости переключения маркера
+                    if current_target_id == MARKER_42 and altitude <= TARGET_ALTITUDE:
+                        current_target_id = MARKER_41
+                        current_length = LENGTH_41
+                        self.send_ssh_message(f"[{datetime.now().strftime('%H:%M:%S')}] ПЕРЕКЛЮЧЕНИЕ: "
+                        f"Новый целевой маркер {current_target_id} (достигнута высота {altitude:.2f}m ≤ {TARGET_ALTITUDE}m)")
+                        continue
+        
+                    # Запуск процедуры посадки
+                    if altitude > self.min_altitude:
+                        if abs(offset_north) < self.pos_tolerance and abs(offset_east) < self.pos_tolerance:
+                            #print("Малые смещения -> Снижение")
+                            self.send_ssh_message("Малые смещения -> Снижение") 
+                            self.descent(0.6)
+
+                        else:
+                            #print(f"Коррекция: Север={offset_north:.2f}m | Восток={offset_east:.2f}m")
+                            #self.send_ssh_message(f"Коррекция: Север={offset_north:.2f}m | Восток={offset_east:.2f}m") 
+                            self.send_offset_command(offset_north, offset_east)
+                        time.sleep(1.3)
+                    else:
+                        if abs(offset_north) < self.pos_tolerance and abs(offset_east) < self.pos_tolerance and not self.land_command_sent:
+                            self.master.set_mode("QLAND")
+                            self.land_command_sent = True
+                            #print("Команда посадки отправлена, режим QLAND")
+                            self.send_ssh_message("Команда посадки отправлена, режим QLAND")
+                        else:
+                            self.send_offset_command(offset_north, offset_east)
+
+            time.sleep(0.01)
+
+    def process_letters_dinam(self):
+        if not self.model_loaded :
+            self.load_model()
+            self.model_loaded = True
+
+        self.send_ssh_message("=== Активирован режим распознавания букв ===")
+        self.last_processing_time = time.time()
+        self.last_save_time = time.time()
+        
+        self.last_inference_time = 0
+        self.inference_interval = 0.1  # Максимум 10 FPS для ML
+        
+        try:
+            while self.current_mode == MODE_LETTERS:
+                new_mode = self.check_mode()
+                if new_mode != self.current_mode:
+                    #self.send_ssh_message(" Выход из режима LETTERS")
+                    self.current_mode = new_mode
+                    return
+
+                current_time = time.time()
+                if current_time - self.last_processing_time < self.processing_interval:
+                    time.sleep(0.01)
+                    continue
+                self.last_processing_time = current_time
+                
+                frame = self.get_frame()
+                if frame is None:
+                    time.sleep(0.1)
+                    self.send_ssh_message("Кадр не получен")
+                    #print("Кадр не получен") 
+                    continue
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                results, thresh_color = self.process_frame_dinam(gray)
+                letter_detected = False
+
+                for result in results:
+                    cv2.drawContours(frame, [result['box']], 0, (0, 255, 0), 2)
+                    cv2.circle(frame, result['center_px'], 5, (0, 0, 255), -1)
+                    
+                    width, height = map(int, cv2.minAreaRect(result['box'])[1])
+                    if width > 40 and height > 40:  # Отсеивание мелких контуров 
+                        try:
+                            letter_crop = cv2.warpPerspective(
+                                thresh_color, 
+                                cv2.getPerspectiveTransform(
+                                    result['box'].astype("float32"),
+                                    np.array([[0, height-1], [0, 0], [width-1, 0], [width-1, height-1]], dtype="float32")
+                                ),
+                                (width, height)
+                            )
+                            
+                            if np.mean(letter_crop) < 250: # Отсеивание засвеченных областей
+                                
+                                img_tensor = self.transform(Image.fromarray(letter_crop)).unsqueeze(0)
+                                
+                                with torch.no_grad():
+                                    output = self.model(img_tensor)
+                                    conf, pred = torch.max(torch.nn.functional.softmax(output, dim=1), 1)
+                                    
+                                    if conf.item() > CONFIDENCE_THRESHOLD:
+                                        letter_detected = True
+                                        self.last_detection_time = current_time
+                                        label = self.labels[pred.item()]   # напр.: "18 ճ"
+                                        label_parts = label.strip().split()
+                                        letter_char  = label_parts[1] if len(label_parts) >= 2 else label
+                                        letter_idx   = label_parts[0] if len(label_parts) >= 1 else "?"
+
+                                        self.letter_stats[label]['confidences'].append(conf.item())
+                                        self.letter_stats[label]['coords'].append(result['coords'])
+                                        self.letter_stats[label]['timestamps'].append(current_time)
+                                    
+                                        self.processing_active = True
+                                        text = f"{letter_char} ({conf.item():.2f})"
+                                        cv2.putText(frame, text, result['center_px'], 
+                                                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                                        
+                                        # ЛОГИРОВАНИЕ ПО ТЗ (строка 29)
+                                        timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                        log_msg = (f"[{timestamp_str}] LETTER: {letter_char} | "
+                                                   f"CONF: {conf.item():.2f} | "
+                                                   f"LAT: {result['coords'][0]:.6f} | "
+                                                   f"LON: {result['coords'][1]:.6f} | "
+                                                   f"ALT: {result['alt']:.2f} | "
+                                                   f"OFFSET_X: {result['raw_dx_m']:.2f} | "
+                                                   f"OFFSET_Y: {result['raw_dy_m']:.2f}")
+                                        self.send_ssh_message(log_msg)
+                                        logging.info(log_msg)
+
+                                        # СОХРАНЕНИЕ КАДРА (ТЗ п.5)
+                                        # Формат: armenian_letter_{coords}_{index}.jpg
+                                        if current_time - self.last_save_time > self.SAVE_INTERVAL:
+                                            coords_str = f"{result['coords'][0]:.6f}_{result['coords'][1]:.6f}"
+                                            filename = os.path.join(
+                                                LETTERS_DIR,
+                                                f"armenian_letter_{coords_str}_{letter_idx}.jpg"
+                                            )
+                                            cv2.imwrite(filename, frame)
+                                            self.last_save_time = current_time
+                                            
+                        except Exception as e:
+                            logging.error(f"Ошибка обработки буквы: {e}")
+                            #self.send_ssh_message(f"Ошибка обработки буквы: {e}")
+                
+
+                if self.processing_active and (current_time - self.last_detection_time) > self.LETTER_TIMEOUT:
+                    if self.letter_stats:
+                        best_letter, best_data = max(self.letter_stats.items(),
+                                                key=lambda x: len(x[1]['confidences']))
+                        
+                        if len(best_data['confidences']) >= self.MIN_DETECTIONS:
+                            avg_conf = sum(best_data['confidences'])/len(best_data['confidences'])
+                            avg_lat = sum(c[0] for c in best_data['coords'])/len(best_data['coords'])
+                            avg_lon = sum(c[1] for c in best_data['coords'])/len(best_data['coords'])
+                            last_time = datetime.fromtimestamp(max(best_data['timestamps'])).strftime('%H:%M:%S')
+                            
+                            log_msg = "\n=== Результаты обработки ==="
+                            log_msg += f"\nНаиболее вероятная буква: {best_letter}"
+                            log_msg += f"\nКоличество обнаружений: {len(best_data['confidences'])}"
+                            log_msg += f"\nСредняя уверенность: {avg_conf:.2f}"
+                            log_msg += f"\nСредние координаты: ({avg_lat:.6f}, {avg_lon:.6f})"
+                            log_msg += f"\nВремя фиксации: {last_time}"
+                            log_msg += "\n==========================="
+                            
+                            #self.send_ssh_message(log_msg)
+                            logging.info(log_msg)
+
+                            # Запись в CSV (ТЗ п.5.2.3.5.2)
+                            self._save_to_csv(best_letter, avg_lat, avg_lon)
+                            
+                            self.processing_sessions.append({
+                                'letter': best_letter,
+                                'count': len(best_data['confidences']),
+                                'avg_confidence': avg_conf,
+                                'avg_coords': (avg_lat, avg_lon),
+                                'timestamp': last_time
+                            })
+                    
+                    self.letter_stats = defaultdict(lambda: {'confidences': [], 'coords': [], 'timestamps': []})
+                    self.processing_active = False
+                
+                time.sleep(LOOP_DELAY)
+                
+        except Exception as e:
+            logging.error(f"Критическая ошибка в режиме LETTERS: {e}")
+            self.send_ssh_message(f"ОШИБКА: {str(e)}")
+        
+        # Финализация последнего сеанса при выходе
+        if self.processing_active and self.letter_stats:
+            best_letter, best_data = max(self.letter_stats.items(),
+                                    key=lambda x: len(x[1]['confidences']))
+            
+            if len(best_data['confidences']) >= self.MIN_DETECTIONS:
+                avg_conf = sum(best_data['confidences'])/len(best_data['confidences'])
+                avg_lat = sum(c[0] for c in best_data['coords'])/len(best_data['coords'])
+                avg_lon = sum(c[1] for c in best_data['coords'])/len(best_data['coords'])
+                last_time = datetime.fromtimestamp(max(best_data['timestamps'])).strftime('%H:%M:%S')
+                
+                log_msg = "\n=== Финальные результаты обработки ==="
+                log_msg += f"\nНаиболее вероятная буква: {best_letter}"
+                log_msg += f"\nКоличество обнаружений: {len(best_data['confidences'])}"
+                log_msg += f"\nСредняя уверенность: {avg_conf:.2f}"
+                log_msg += f"\nСредние координаты: ({avg_lat:.6f}, {avg_lon:.6f})"
+                log_msg += f"\nВремя фиксации: {last_time}"
+                log_msg += "\n====================================="
+                
+                #self.send_ssh_message(log_msg)
+                logging.info(log_msg)
+
+                # Запись в CSV при финальном выходе из режима (ТЗ п.5.2.3.5.2)
+                self._save_to_csv(best_letter, avg_lat, avg_lon)
+
+                self.processing_sessions.append({
+                    'letter': best_letter,
+                    'count': len(best_data['confidences']),
+                    'avg_confidence': avg_conf,
+                    'avg_coords': (avg_lat, avg_lon),
+                    'timestamp': last_time
+                })
+        
+        # Вывод сводки всех сеансов
+        if self.processing_sessions:
+            log_msg = "\n=== Сводка всех сеансов обработки ==="
+            for i, session in enumerate(self.processing_sessions, 1):
+                log_msg += f"\n{i}. Буква: {session['letter']}"
+                log_msg += f"\n   Обнаружений: {session['count']}"
+                log_msg += f"\n   Уверенность: {session['avg_confidence']:.2f}"
+                log_msg += f"\n   Координаты: {session['avg_coords']}"
+                log_msg += f"\n   Время: {session['timestamp']}"
+                log_msg += "\n-----------------------------"
+            
+            #self.send_ssh_message(log_msg)
+            logging.info(log_msg)
+    
+    def process_letters_static(self):
+        if not self.model_loaded :
+            self.load_model()
+            self.model_loaded = True
+
+        self.send_ssh_message("=== Активирован режим распознавания букв ===")
+        self.last_processing_time = time.time()
+        self.last_save_time = time.time()
+        
+        try:
+            while self.current_mode == MODE_LETTERS:
+                new_mode = self.check_mode()
+                if new_mode != self.current_mode:
+                    self.send_ssh_message(" Выход из режима LETTERS")
+                    self.current_mode = new_mode
+                    return
+
+                current_time = time.time()
+                if current_time - self.last_processing_time < self.processing_interval:
+                    time.sleep(0.01)
+                    continue
+                self.last_processing_time = current_time
+                
+                frame = self.get_frame()
+                if frame is None:
+                    time.sleep(0.1)
+                    self.send_ssh_message("Кадр не получен")
+                    #print("Кадр не получен") 
+                    continue
+                
+                results, thresh_color = self.process_frame_dinam(frame)
+                letter_detected = False
+
+                for result in results:
+                    cv2.drawContours(frame, [result['box']], 0, (0, 255, 0), 2)
+                    cv2.circle(frame, result['center_px'], 5, (0, 0, 255), -1)
+                    
+                    width, height = map(int, cv2.minAreaRect(result['box'])[1])
+                    if width > 40 and height > 40:  # Отсеивание мелких контуров 
+                        try:
+                            letter_crop = cv2.warpPerspective(
+                                thresh_color, 
+                                cv2.getPerspectiveTransform(
+                                    result['box'].astype("float32"),
+                                    np.array([[0, height-1], [0, 0], [width-1, 0], [width-1, height-1]], dtype="float32")
+                                ),
+                                (width, height)
+                            )
+                            
+                            if np.mean(letter_crop) < 250: # Отсеивание засвеченных областей
+                                
+                                img_tensor = self.transform(Image.fromarray(letter_crop)).unsqueeze(0)
+                                
+                                with torch.no_grad():
+                                    output = self.model(img_tensor)
+                                    conf, pred = torch.max(torch.nn.functional.softmax(output, dim=1), 1)
+                                    
+                                    if conf.item() > CONFIDENCE_THRESHOLD:
+                                        letter_detected = True
+                                        self.last_detection_time = current_time
+                                        label = self.labels[pred.item()]
+                                        self.letter_stats[label]['confidences'].append(conf.item())
+                                        self.letter_stats[label]['coords'].append(result['coords'])
+                                        self.letter_stats[label]['timestamps'].append(current_time)
+                                    
+                                        self.processing_active = True
+                                        text = f"{label} ({conf.item():.2f})"
+                                        cv2.putText(frame, text, result['center_px'], 
+                                                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                                        self.send_ssh_message(f"Распознано: {text} | Координаты: {result['coords']}")
+                                        logging.info(f"Распознано: {text} | Координаты: {result['coords']}")
+                        except Exception as e:
+                            logging.error(f"Ошибка обработки буквы: {e}")
+                            #self.send_ssh_message(f"Ошибка обработки буквы: {e}")
+                
+                # Добавить сохранения по регламенту СКАТа. Изменить пути логирования.
+                if letter_detected and (current_time - self.last_save_time > self.SAVE_INTERVAL):
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    filename = os.path.join(LETTERS_DIR, f"armenian_letter_{timestamp}.jpg")
+                    if not os.path.exists(filename):
+                        cv2.imwrite(filename, frame)
+                        self.send_ssh_message(f" Сохранено: {filename}")
+                        self.last_save_time = current_time
+                
+
+                if self.processing_active and (current_time - self.last_detection_time) > self.LETTER_TIMEOUT:
+                    if self.letter_stats:
+                        best_letter, best_data = max(self.letter_stats.items(),
+                                                key=lambda x: len(x[1]['confidences']))
+                        
+                        if len(best_data['confidences']) >= self.MIN_DETECTIONS:
+                            avg_conf = sum(best_data['confidences'])/len(best_data['confidences'])
+                            avg_lat = sum(c[0] for c in best_data['coords'])/len(best_data['coords'])
+                            avg_lon = sum(c[1] for c in best_data['coords'])/len(best_data['coords'])
+                            last_time = datetime.fromtimestamp(max(best_data['timestamps'])).strftime('%H:%M:%S')
+                            
+                            log_msg = "\n=== Результаты обработки ==="
+                            log_msg += f"\nНаиболее вероятная буква: {best_letter}"
+                            log_msg += f"\nКоличество обнаружений: {len(best_data['confidences'])}"
+                            log_msg += f"\nСредняя уверенность: {avg_conf:.2f}"
+                            log_msg += f"\nСредние координаты: ({avg_lat:.6f}, {avg_lon:.6f})"
+                            log_msg += f"\nВремя фиксации: {last_time}"
+                            log_msg += "\n==========================="
+                            
+                            #self.send_ssh_message(log_msg)
+                            logging.info(log_msg)
+                            
+                            self.processing_sessions.append({
+                                'letter': best_letter,
+                                'count': len(best_data['confidences']),
+                                'avg_confidence': avg_conf,
+                                'avg_coords': (avg_lat, avg_lon),
+                                'timestamp': last_time
+                            })
+                    
+                    self.letter_stats = defaultdict(lambda: {'confidences': [], 'coords': [], 'timestamps': []})
+                    self.processing_active = False
+                
+                time.sleep(LOOP_DELAY)
+                
+        except Exception as e:
+            logging.error(f"Критическая ошибка в режиме LETTERS: {e}")
+            self.send_ssh_message(f"ОШИБКА: {str(e)}")
+        
+        # Финализация последнего сеанса при выходе
+        
+        # Проверить логику получения координат, обработку и пересчёт
+        # ФОРМАТ : <НОМЕР БУКВЫ>, <ШИРОТА 1e7>, <ДОЛГОТА 1e7>
+        
+        if self.processing_active and self.letter_stats:
+            best_letter, best_data = max(self.letter_stats.items(),
+                                    key=lambda x: len(x[1]['confidences']))
+            
+            if len(best_data['confidences']) >= self.MIN_DETECTIONS:
+                avg_conf = sum(best_data['confidences'])/len(best_data['confidences'])
+                avg_lat = sum(c[0] for c in best_data['coords'])/len(best_data['coords'])
+                avg_lon = sum(c[1] for c in best_data['coords'])/len(best_data['coords'])
+                last_time = datetime.fromtimestamp(max(best_data['timestamps'])).strftime('%H:%M:%S')
+                
+                log_msg = "\n=== Финальные результаты обработки ==="
+                log_msg += f"\nНаиболее вероятная буква: {best_letter}"
+                log_msg += f"\nКоличество обнаружений: {len(best_data['confidences'])}"
+                log_msg += f"\nСредняя уверенность: {avg_conf:.2f}"
+                log_msg += f"\nСредние координаты: ({avg_lat:.6f}, {avg_lon:.6f})"
+                log_msg += f"\nВремя фиксации: {last_time}"
+                log_msg += "\n====================================="
+                
+                #self.send_ssh_message(log_msg)
+                logging.info(log_msg)
+
+                self.processing_sessions.append({
+                    'letter': best_letter,
+                    'count': len(best_data['confidences']),
+                    'avg_confidence': avg_conf,
+                    'avg_coords': (avg_lat, avg_lon),
+                    'timestamp': last_time
+                })
+        
+        # Вывод сводки всех сеансов
+        if self.processing_sessions:
+            log_msg = "\n=== Сводка всех сеансов обработки ==="
+            for i, session in enumerate(self.processing_sessions, 1):
+                log_msg += f"\n{i}. Буква: {session['letter']}"
+                log_msg += f"\n   Обнаружений: {session['count']}"
+                log_msg += f"\n   Уверенность: {session['avg_confidence']:.2f}"
+                log_msg += f"\n   Координаты: {session['avg_coords']}"
+                log_msg += f"\n   Время: {session['timestamp']}"
+                log_msg += "\n-----------------------------"
+            
+            #self.send_ssh_message(log_msg)
+            logging.info(log_msg)
+
+    def _save_to_csv(self, letter_label, avg_lat, avg_lon):
+        """Записывает распознанный объект в objects-coordinates.csv.
+
+        Формат строки (ТЗ п.5.2.3.5.2):
+            <индекс буквы в labels.txt>,<широта×1e7>,<долгота×1e7>
+        Пример: 5,562918040,440342093
+
+        letter_label приходит из self.labels[pred.item()] и имеет формат "5 Զ"
+        (строка целиком: "<индекс> <буква>") — индекс берём напрямую из parts[0].
+        """
+        try:
+            # letter_label = "5 Զ" → parts[0] = "5" (индекс), parts[1] = "Զ" (буква)
+            parts = letter_label.strip().split()
+            letter_index = int(parts[0]) if len(parts) >= 1 else -1
+
+            lat_e7 = int(round(avg_lat * 1e7))
+            lon_e7 = int(round(avg_lon * 1e7))
+
+            with open(CSV_PATH, 'a', newline='', encoding='utf-8') as f:
+                f.write(f"{letter_index},{lat_e7},{lon_e7}\n")
+
+            letter_char = parts[1] if len(parts) >= 2 else "?"
+            log_msg = f"CSV записано: {letter_index},{lat_e7},{lon_e7} (буква: {letter_char})"
+            self.send_ssh_message(log_msg)
+            logging.info(log_msg)
+
+        except Exception as e:
+            logging.error(f"Ошибка записи CSV: {e}")
+
+    def check_mode(self):
+        wp = self.get_current_waypoint()
+        rc_val = self.get_rc_value()        
+        new_mode = None
+                
+        if rc_val is not None and rc_val != self.last_rc_value:
+            new_mode = self.rc_to_mode(rc_val)
+            self.last_rc_value = rc_val
+            logging.info(f"RC: {rc_val} -> {self.mode_name(new_mode)}")
+            #print(f"RC: {rc_val} -> {self.mode_name(new_mode)}")
+            self.send_ssh_message(f"RC: {rc_val} -> {self.mode_name(new_mode)}") 
+                
+        elif wp is not None and wp != self.last_wp_value and wp in self.wp_modes:
+            new_mode = self.wp_modes[wp]
+            self.last_wp_value = wp
+            logging.info(f"WP: {wp} -> {self.mode_name(new_mode)}")
+            #print(f"WP: {wp} -> {self.mode_name(new_mode)}")
+            self.send_ssh_message(f"WP: {wp} -> {self.mode_name(new_mode)}") 
+                
+        if new_mode is not None and new_mode != self.current_mode:
+            self.current_mode = new_mode
+            self.handle_mode_switch(new_mode)
+        
+        return self.current_mode
+
+    def mode_name(self, mode):
+        return ["OFF", "LETTERS", "ARUCO", "MGM"][mode]
+
+    def run(self):
+        #self.send_ssh_message(" Запуск компьютера - компаньона ")
+        try:
+            while True:
+                try:  
+                    self.current_mode = self.check_mode()
+                    
+                    # Всегда освобождаем камеру при переходе в OFF
+                    if self.current_mode == MODE_OFF and not self.process_OFF:
+                        self.release_camera()
+                        self.process_LETTERS = False
+                        self.process_ARUCO = False
+                        self.process_MGM = False
+                        self.process_OFF = True
+                        time.sleep(0.1)
+                        continue
+                        
+                    elif self.current_mode == MODE_LETTERS and not self.process_LETTERS:
+                        self.USE_PICAM = True
+                        self.USE_USB_CAM = False
+                        self.init_camera()
+                        
+                        # Проверяем успешность инициализации
+                        if self.camera:
+                            self.process_letters_dinam()
+                            self.process_LETTERS = True
+                            self.process_ARUCO = False
+                            self.process_MGM = False
+                            self.process_OFF = False
+                        else:
+                            self.send_ssh_message("Ошибка инициализации камеры для LETTERS")
+                            self.current_mode = MODE_OFF
+
+                    elif self.current_mode == MODE_ARUCO and not self.process_ARUCO:
+                        self.USE_PICAM = False
+                        self.USE_USB_CAM = True     
+                        self.init_camera()
+                        # Проверяем успешность инициализации
+                        if self.camera and (self.USE_USB_CAM and self.camera.isOpened()):
+                            self.process_aruco()
+                            self.process_ARUCO = True
+                            self.process_LETTERS = False
+                            self.process_MGM = False
+                            self.process_OFF = False
+                        else:
+                            self.send_ssh_message("Ошибка инициализации камеры для ARUCO")
+                            self.current_mode = MODE_OFF
+                    
+                    elif self.current_mode == MODE_MGM and not self.process_MGM:
+                        self.USE_PICAM = False
+                        self.USE_USB_CAM = True  
+                        self.process_mgm()
+                        self.process_ARUCO = False
+                        self.process_LETTERS = False                        
+                        self.process_MGM = True
+                        self.process_OFF = False
+                        # После завершения MGM возвращаемся в режим OFF
+                        self.current_mode = MODE_OFF
+                        self.handle_mode_switch(MODE_OFF)                       
+
+                    time.sleep(0.01)
+                    
+                except Exception as inner_e:
+                    logging.error(f"Ошибка в основном цикле: {inner_e}")
+                    self.send_ssh_message(f"Внутренняя ошибка: {inner_e}")
+                    time.sleep(1)
+                
+        except KeyboardInterrupt:
+            self.send_ssh_message("--- Завершение работы ---")
+            self.release_camera()
+        except Exception as e:
+            self.send_ssh_message(f"КРИТИЧЕСКАЯ ОШИБКА: {str(e)}")
+            logging.critical(f"Необработанное исключение: {e}")
+
+if __name__ == '__main__':
+    controller = DroneController()
+    controller.run()
+
+
+
+

@@ -1,0 +1,55 @@
+image_width: 320
+image_height: 240
+camera_name: cam0
+camera_matrix:
+  rows: 3
+  cols: 3
+  data:
+  - 5238.795364341175
+  - 0.0
+  - 193.8034200126729
+  - 0.0
+  - 5232.571368555152
+  - 142.36406534025255
+  - 0.0
+  - 0.0
+  - 1.0
+distortion_model: rational_polynomial
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data:
+  - 8.139918026571035
+  - 0.3669998703979156
+  - 0.08599953463749058
+  - 0.08592070231089124
+  - 0.07162871155511072
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data:
+  - 1
+  - 0
+  - 0
+  - 0
+  - 1
+  - 0
+  - 0
+  - 0
+  - 1
+projection_matrix:
+  rows: 3
+  cols: 4
+  data:
+  - 5238.795364341175
+  - 0.0
+  - 193.8034200126729
+  - 0.0
+  - 0.0
+  - 5232.571368555152
+  - 142.36406534025255
+  - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+  - 0.0

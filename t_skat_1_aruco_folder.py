@@ -75,7 +75,7 @@ while True:
             print(f"💾 Сохранено изображение: {filename}")
             last_save_time = time.time()
 
-    cv2.imshow("Aruco Tracker", frame)
+    #cv2.imshow("Aruco Tracker", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 

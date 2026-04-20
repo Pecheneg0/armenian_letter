@@ -56,7 +56,7 @@ from modeln import ArmenianLetterNet
 class DroneController:
     def __init__(self):
         self.master = None
-        self.current_mode = MODE_OFF
+        self.current_mode = MODE_LETTERS # MODE_OFF
         self.camera = None
         self.model = None
         self.labels = []

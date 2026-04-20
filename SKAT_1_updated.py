@@ -56,7 +56,7 @@ from modeln import ArmenianLetterNet
 class DroneController:
     def __init__(self):
         self.master = None
-        self.current_mode = MODE_OFF
+        self.current_mode = MODE_LETTERS # MODE_OFF
         self.camera = None
         self.model = None
         self.labels = []
@@ -304,12 +304,12 @@ class DroneController:
         self.send_ssh_message("🚀 Запуск контроллера")
         try:
             while True:
-                new_mode = self.check_rc_mode()
+                #new_mode = self.check_rc_mode()
 
-                if new_mode != self.current_mode:
-                    self.send_ssh_message(f"Режим: {self.current_mode_str} → {new_mode}")
-                    self.current_mode = new_mode
-                    self.current_mode_str = {MODE_OFF: "OFF", MODE_LETTERS: "LETTERS", MODE_ARUCO: "ARUCO"}.get(new_mode, "UNKNOWN")
+                #if new_mode != self.current_mode:
+                    #self.send_ssh_message(f"Режим: {self.current_mode_str} → {new_mode}")
+                    #self.current_mode = new_mode
+                    #self.current_mode_str = {MODE_OFF: "OFF", MODE_LETTERS: "LETTERS", MODE_ARUCO: "ARUCO"}.get(new_mode, "UNKNOWN")
                     self.release_camera()
 
                     if self.current_mode == MODE_LETTERS:
@@ -319,7 +319,7 @@ class DroneController:
                         self.init_camera()
                         self.process_aruco()
 
-                time.sleep(LOOP_DELAY)
+                    time.sleep(LOOP_DELAY)
         except KeyboardInterrupt:
             self.send_ssh_message("---  Stop all scripts  ---")
             self.release_camera()
